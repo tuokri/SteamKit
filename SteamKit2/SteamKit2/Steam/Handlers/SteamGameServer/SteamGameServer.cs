@@ -5,6 +5,8 @@
 
 using System;
 using System.Collections.Generic;
+using System.IO;
+using System.IO.Compression;
 using System.Net;
 using System.Net.Sockets;
 using SteamKit2.Internal;
@@ -82,6 +84,9 @@ namespace SteamKit2
             {
                 { EMsg.GSStatusReply, HandleStatusReply },
                 { EMsg.ClientTicketAuthComplete, HandleAuthComplete },
+                { EMsg.ClientRequestedClientStats, HandleClientRequestedClientStats },
+                { EMsg.ClientServersAvailable, HandleClientServersAvailable },
+                { EMsg.Multi, HandleMulti },
             };
         }
 
@@ -211,6 +216,19 @@ namespace SteamKit2
         {
             ArgumentNullException.ThrowIfNull( packetMsg );
 
+            try
+            {
+                this.Client.DebugNetworkListener?.OnIncomingNetworkMessage( packetMsg.MsgType,
+                    packetMsg.GetData() );
+            }
+            catch ( Exception e )
+            {
+                this.Client.LogDebug( "SteamGameServer",
+                    "DebugNetworkListener threw an exception: {0}", e );
+            }
+
+            this.Client.LogDebug( "SteamGameServer", "HandleMsg: {0}", packetMsg.MsgType );
+
             if ( !dispatchMap.TryGetValue( packetMsg.MsgType, out var handlerFunc ) )
             {
                 // ignore messages that we don't have a handler function for
@@ -236,6 +254,89 @@ namespace SteamKit2
             var callback = new TicketAuthCallback( authComplete.Body );
             this.Client.PostCallback( callback );
         }
+        void HandleClientRequestedClientStats( IPacketMsg packetMsg )
+        {
+            var clientRequestedClientStats =
+                new ClientMsgProtobuf<CMsgClientRequestedClientStats>( packetMsg );
+
+            var clientStat2 = new ClientMsgProtobuf<CMsgClientStat2>( EMsg.ClientStat2 );
+            foreach ( var statsToSend in clientRequestedClientStats.Body.stats_to_send )
+            {
+                var statDetail = new CMsgClientStat2.StatDetail
+                {
+                    client_stat = statsToSend.client_stat,
+                    app_id = 418460,
+                    depot_id = 418461,
+                    time_of_day = ( uint )DateTime.Now.TimeOfDay.TotalMilliseconds,
+                    cell_id = 0,
+                };
+
+                clientStat2.Body.stat_detail.Add( statDetail );
+            }
+
+            this.Client.Send( clientStat2 );
+        }
+
+        void HandleMulti( IPacketMsg packetMsg )
+        {
+            if ( !packetMsg.IsProto )
+            {
+                this.Client.LogDebug( "SteamGameServer", "HandleMulti got non-proto MsgMulti!!" );
+                return;
+            }
+
+            var msgMulti = new ClientMsgProtobuf<CMsgMulti>( packetMsg );
+
+            byte[] payload = msgMulti.Body.message_body;
+
+            if ( msgMulti.Body.size_unzipped > 0 )
+            {
+                try
+                {
+                    using var compressedStream = new MemoryStream( payload );
+                    using var gzipStream =
+                        new GZipStream( compressedStream, CompressionMode.Decompress );
+                    using var decompressedStream = new MemoryStream();
+                    gzipStream.CopyTo( decompressedStream );
+                    payload = decompressedStream.ToArray();
+                }
+                catch ( Exception ex )
+                {
+                    this.Client.LogDebug( "SteamGameServer",
+                        "HandleMulti encountered an exception when decompressing.\n{0}",
+                        ex.ToString() );
+                    return;
+                }
+            }
+
+            using var ms = new MemoryStream( payload );
+            using var br = new BinaryReader( ms );
+            while ( ( ms.Length - ms.Position ) != 0 )
+            {
+                int subSize = br.ReadInt32();
+                byte[] subData = br.ReadBytes( subSize );
+
+                var msg = CMClient.GetPacketMsg( subData, this.Client );
+                if ( msg != null )
+                {
+                    HandleMsg( msg );
+                }
+            }
+        }
+
+        void HandleClientServersAvailable( IPacketMsg packetMsg )
+        {
+            var msgClientServersAvailable =
+                new ClientMsgProtobuf<CMsgClientServersAvailable>( packetMsg );
+
+            foreach ( var serverType in msgClientServersAvailable.Body.server_types_available )
+            {
+                this.Client.LogDebug(
+                    "SteamGameServer", "HandleClientServersAvailable: {0} {1}",
+                    serverType.server, serverType.changed );
+            }
+        }
+
         #endregion
     }
 }
